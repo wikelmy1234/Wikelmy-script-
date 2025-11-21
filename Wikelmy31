@@ -1,0 +1,145 @@
+-- ServerScriptService/HubServer.lua
+-- Maneja spawns seguros, auto-spawn, limpiar modelos y curación (solo para VIPs configurados)
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local remote = ReplicatedStorage:FindFirstChild("Hub_RemoteEvent")
+if not remote then
+    remote = Instance.new("RemoteEvent")
+    remote.Name = "Hub_RemoteEvent"
+    remote.Parent = ReplicatedStorage
+end
+
+-- CONFIG
+local SERVER_VIP_IDS = {12345678, 87654321} -- cambia a tus UserIds
+local MODEL_NAME_DEFAULT = "Brairot" -- modelo base en ServerStorage
+local MODEL_CLEAN_PREFIX = "HubSpawned_" -- prefix usado al crear clones para limpiar fácilmente
+
+-- Tabla para auto-spawns: player.UserId -> {modelName, interval, task}
+local autoSpawners = {}
+
+local function isVIP(player)
+    for _, id in ipairs(SERVER_VIP_IDS) do
+        if player.UserId == id then return true end
+    end
+    return false
+end
+
+local function spawnModelForPlayer(player, modelName)
+    local model = ServerStorage:FindFirstChild(modelName)
+    if not model then return false, "Modelo no encontrado en ServerStorage: ".. modelName end
+    local clone = model:Clone()
+    -- ponle un nombre identificable para limpieza
+    clone.Name = MODEL_CLEAN_PREFIX .. (modelName or MODEL_NAME_DEFAULT)
+    clone.Parent = workspace
+
+    -- tratar PrimaryPart para posicionar correctamente
+    if clone.PrimaryPart then
+        -- preferir un HubSpawn en workspace
+        local spawnPoint = workspace:FindFirstChild("HubSpawn") 
+        if spawnPoint and spawnPoint:IsA("BasePart") then
+            clone:SetPrimaryPartCFrame(spawnPoint.CFrame + Vector3.new(0, clone:GetExtentsSize().Y/2 + 1, 0))
+        else
+            local char = player.Character
+            if char and char.PrimaryPart then
+                clone:SetPrimaryPartCFrame(char.PrimaryPart.CFrame * CFrame.new(0,0,-6))
+            else
+                clone:SetPrimaryPartCFrame(CFrame.new(0,5,0))
+            end
+        end
+    end
+
+    return true
+end
+
+local function startAutoSpawn(player, modelName, interval)
+    local uid = player.UserId
+    if autoSpawners[uid] then return false, "Ya tienes un autospawner activo." end
+    interval = math.max(1, tonumber(interval) or 10)
+    local running = true
+
+    autoSpawners[uid] = {
+        stop = function() running = false end
+    }
+
+    -- spawn loop en un hilo separado
+    spawn(function()
+        while running and player.Parent and player.Character do
+            spawnModelForPlayer(player, modelName or MODEL_NAME_DEFAULT)
+            for i=1,interval do
+                if not running then break end
+                wait(1)
+            end
+        end
+        autoSpawners[uid] = nil
+    end)
+    return true
+end
+
+local function stopAutoSpawn(player)
+    local uid = player.UserId
+    if autoSpawners[uid] then
+        autoSpawners[uid].stop()
+        autoSpawners[uid] = nil
+        return true
+    end
+    return false, "No había autospawner activo."
+end
+
+local function cleanModels(player, prefix)
+    prefix = prefix or MODEL_CLEAN_PREFIX
+    local removed = 0
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if obj:IsA("Model") and obj.Name:sub(1, #prefix) == prefix then
+            obj:Destroy()
+            removed = removed + 1
+        end
+    end
+    return removed
+end
+
+-- Server remote handler
+remote.OnServerEvent:Connect(function(player, action, data)
+    action = tostring(action or "")
+    data = data or {}
+
+    if action == "spawnModel" then
+        if not isVIP(player) then return end
+        local modelName = data.modelName or MODEL_NAME_DEFAULT
+        local ok, err = spawnModelForPlayer(player, modelName)
+        if not ok and err then warn(err) end
+
+    elseif action == "startAutoSpawn" then
+        if not isVIP(player) then return end
+        local modelName = data.modelName or MODEL_NAME_DEFAULT
+        local interval = data.interval or 10
+        startAutoSpawn(player, modelName, interval)
+
+    elseif action == "stopAutoSpawn" then
+        if not isVIP(player) then return end
+        stopAutoSpawn(player)
+
+    elseif action == "cleanModels" then
+        if not isVIP(player) then return end
+        local prefix = data.prefix or MODEL_CLEAN_PREFIX
+        local removed = cleanModels(player, prefix)
+        -- opcional: enviar confirmación al cliente
+        remote:FireClient(player, "cleanResult", { removed = removed })
+
+    elseif action == "healPlayer" then
+        -- permitir curación si VIP (evita abuso)
+        if not isVIP(player) then return end
+        local target = player.Character and player.Character:FindFirstChild("Humanoid")
+        if target then
+            target.Health = target.MaxHealth
+        end
+    end
+end)
+
+-- limpieza cuando el servidor apaga o reinicia (intentar parar autospawners)
+Players.PlayerRemoving:Connect(function(player)
+    autoSpawners[player.UserId] = nil
+end)
